@@ -1,0 +1,12 @@
+<?xml version="1.0" standalone="yes"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:svg="http://www.w3.org/2000/svg" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://web.resource.org/cc/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" width="200" height="26">
+<path style="fill:#f3bb65; stroke:none;" d="M0 0L0 1L200 1L181 0L141 0L0 0z"/>
+<path style="fill:#fdb909; stroke:none;" d="M0 1L0 6L200 7L200 1L0 1z"/>
+<path style="fill:#f5c53d; stroke:none;" d="M0 6L0 11L200 11L200 7L0 6z"/>
+<path style="fill:#e5a715; stroke:none;" d="M0 11L0 13L200 13L200 11L0 11z"/>
+<path style="fill:#d98f03; stroke:none;" d="M0 13L0 16L200 16L200 13L0 13z"/>
+<path style="fill:#c17501; stroke:none;" d="M0 16L0 19L200 19L200 16L0 16z"/>
+<path style="fill:#9d4f01; stroke:none;" d="M0 19L0 23L200 23L200 19L0 19z"/>
+<path style="fill:#752d03; stroke:none;" d="M0 23L0 24L200 24L181 23L141 23L0 23z"/>
+<path style="fill:#3f1f0f; stroke:none;" d="M0 24L0 26L200 26L200 24L0 24z"/>
+</svg>

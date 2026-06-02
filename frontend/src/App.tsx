@@ -133,10 +133,10 @@ function App() {
         if (res.ok && data.user) {
           setUser(data.user);
           setSelectedAvatar(data.user.avatarUrl || "default_avatar");
-          
+
           socket.auth = { token };
           socket.connect();
-          
+
           setScreen("menu");
         } else {
           localStorage.removeItem("truco_token");
@@ -420,7 +420,7 @@ function App() {
       localStorage.setItem("truco_token", data.token);
       setUser(data.user);
       setSelectedAvatar(data.user.avatarUrl || "default_avatar");
-      
+
       socket.auth = { token: data.token };
       socket.connect();
 
@@ -676,6 +676,7 @@ function App() {
     setGame(g);
     setEnvidoLocked(false);
     socket.emit("joinGame", { gameId: g.id });
+    setScreen("game");
   };
 
   const playCard = (card: string) => {
@@ -1105,13 +1106,13 @@ function App() {
             </div>
 
             <div className="auth-tabs">
-              <button 
+              <button
                 className={`auth-tab-btn ${authTab === "login" ? "active" : ""}`}
                 onClick={() => setAuthTab("login")}
               >
                 Ingresar
               </button>
-              <button 
+              <button
                 className={`auth-tab-btn ${authTab === "register" ? "active" : ""}`}
                 onClick={() => {
                   setAuthTab("register");
@@ -1122,7 +1123,7 @@ function App() {
               >
                 Registrarse
               </button>
-              <button 
+              <button
                 className={`auth-tab-btn ${authTab === "verify" ? "active" : ""}`}
                 onClick={() => setAuthTab("verify")}
               >
@@ -1570,8 +1571,8 @@ function App() {
                     )}
                   </div>
                   <div className="envido-modal-footer">
-                    <button 
-                      className="envido-modal-btn" 
+                    <button
+                      className="envido-modal-btn"
                       disabled={!allowContinue}
                       onClick={() => {
                         soundEffects.playClick();
@@ -1722,9 +1723,9 @@ function App() {
           <div className="actions">
             {/* CALLS */}
             <div className="calls">
-              
+
               {/* COLLAPSIBLE ENVIDO DROPDOWN */}
-              <div 
+              <div
                 ref={dropdownRef}
                 className="envido-dropdown-container"
                 onMouseLeave={() => {
@@ -1734,7 +1735,7 @@ function App() {
               >
                 <AnimatePresence>
                   {showEnvidoDropdown && (
-                    <motion.div 
+                    <motion.div
                       className="envido-dropdown-menu"
                       initial={{ opacity: 0, y: 10, x: "-50%", scale: 0.95 }}
                       animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }}
@@ -1851,58 +1852,58 @@ function App() {
               (!game.envido?.pending &&
                 game.truco?.pending &&
                 game.truco.caller !== user.id)) && (
-              <div className="response">
-                <span>
-                  {game.envido?.pending
-                    ? `${getLastEnvidoCallLabel()}:`
-                    : `${getPendingTrucoLabel()}:`}
-                </span>
+                <div className="response">
+                  <span>
+                    {game.envido?.pending
+                      ? `${getLastEnvidoCallLabel()}:`
+                      : `${getPendingTrucoLabel()}:`}
+                  </span>
 
-                <button
-                  className="btn-yes"
-                  onClick={() => {
-                    soundEffects.playClick();
-                    if (game.envido?.pending) {
-                      socket.emit("respondEnvido", {
-                        gameId: game.id,
-                        userId: user.id,
-                        accept: true,
-                      });
-                    } else {
-                      socket.emit("respondTruco", {
-                        gameId: game.id,
-                        userId: user.id,
-                        accept: true,
-                      });
-                    }
-                  }}
-                >
-                  Quiero
-                </button>
+                  <button
+                    className="btn-yes"
+                    onClick={() => {
+                      soundEffects.playClick();
+                      if (game.envido?.pending) {
+                        socket.emit("respondEnvido", {
+                          gameId: game.id,
+                          userId: user.id,
+                          accept: true,
+                        });
+                      } else {
+                        socket.emit("respondTruco", {
+                          gameId: game.id,
+                          userId: user.id,
+                          accept: true,
+                        });
+                      }
+                    }}
+                  >
+                    Quiero
+                  </button>
 
-                <button
-                  className="btn-no"
-                  onClick={() => {
-                    soundEffects.playClick();
-                    if (game.envido?.pending) {
-                      socket.emit("respondEnvido", {
-                        gameId: game.id,
-                        userId: user.id,
-                        accept: false,
-                      });
-                    } else {
-                      socket.emit("respondTruco", {
-                        gameId: game.id,
-                        userId: user.id,
-                        accept: false,
-                      });
-                    }
-                  }}
-                >
-                  No Quiero
-                </button>
-              </div>
-            )}
+                  <button
+                    className="btn-no"
+                    onClick={() => {
+                      soundEffects.playClick();
+                      if (game.envido?.pending) {
+                        socket.emit("respondEnvido", {
+                          gameId: game.id,
+                          userId: user.id,
+                          accept: false,
+                        });
+                      } else {
+                        socket.emit("respondTruco", {
+                          gameId: game.id,
+                          userId: user.id,
+                          accept: false,
+                        });
+                      }
+                    }}
+                  >
+                    No Quiero
+                  </button>
+                </div>
+              )}
           </div>
 
           {/* ===== GAME CONTROLS (NEXT HAND / NEW MATCH) ===== */}
@@ -1965,8 +1966,8 @@ function App() {
                 <div className="toast-modal-text">{toast.message}</div>
               </div>
               <div className="envido-modal-footer text-center" style={{ marginTop: "16px" }}>
-                <button 
-                  className="envido-modal-btn" 
+                <button
+                  className="envido-modal-btn"
                   onClick={() => {
                     soundEffects.playClick();
                     setToast(null);

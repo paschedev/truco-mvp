@@ -1,0 +1,23 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id                String   @id @default(uuid())
+  username          String   @unique
+  email             String   @unique
+  passwordHash      String
+  verified          Boolean  @default(false)
+  verificationToken String?
+  coins             Int      @default(1000)
+  wins              Int      @default(0)
+  losses            Int      @default(0)
+  avatarUrl         String   @default("default_avatar")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}

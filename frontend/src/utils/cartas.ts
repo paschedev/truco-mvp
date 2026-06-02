@@ -42,7 +42,7 @@ import diezCopa from "../assets/cartas/10-copa.png";
 import onceCopa from "../assets/cartas/11-copa.png";
 import doceCopa from "../assets/cartas/12-copa.png";
 
-export const cartasImg = {
+export const cartasImg: Record<string, string> = {
   "1-espada": unoEspada,
   "2-espada": dosEspada,
   "3-espada": tresEspada,
@@ -88,14 +88,22 @@ export const cartasImg = {
   "12-copa": doceCopa,
 };
 
-export const palos = ["espada", "basto", "oro", "copa"];
-export const numeros = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12];
+export const palos = ["espada", "basto", "oro", "copa"] as const;
+export const numeros = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12] as const;
 
-export function getCartaImg(carta) {
+export function getCartaImg(carta: string): string {
   return cartasImg[carta];
 }
 
-export function generarMazo() {
+export interface CartaInfo {
+  numero: number;
+  palo: string;
+  id: string;
+  nombre: string;
+  img: string;
+}
+
+export function generarMazo(): CartaInfo[] {
   return palos.flatMap((palo) =>
     numeros.map((numero) => {
       const id = `${numero}-${palo}`;
@@ -107,6 +115,6 @@ export function generarMazo() {
         nombre: `${numero} de ${palo}`,
         img: getCartaImg(id),
       };
-    }),
+    })
   );
 }

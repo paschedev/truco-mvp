@@ -1,7 +1,15 @@
 import express from "express";
 import http from "http";
-import { Server } from "socket.io";
+import { Server, Socket } from "socket.io";
 import cors from "cors";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+import dotenv from "dotenv";
+import { prisma } from "./db.js";
+
+dotenv.config();
+
+const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret";
 
 const app = express();
 app.use(cors());
@@ -10,46 +18,473 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-const games = {};
-const users = [];
+// ================= TYPES =================
+export interface CardPlay {
+  userId: string;
+  card: string;
+}
 
-// ================= LOGIN =================
-app.post("/auth/login", (req, res) => {
-  const { username } = req.body;
+export interface Score {
+  [playerId: string]: number;
+}
 
-  let user = users.find((u) => u.username === username);
+export interface EnvidoState {
+  calls: string[];
+  pending: boolean;
+  caller: string | null;
+}
 
-  if (!user) {
-    user = { id: Date.now().toString(), username };
-    users.push(user);
+export interface TrucoState {
+  level: number;
+  pending: boolean;
+  caller: string | null;
+  acceptedBy: string | null;
+  canRaiseBy: string | null;
+}
+
+export interface EnvidoStep {
+  playerId: string;
+  type: 'points' | 'good';
+  value: number | string;
+}
+
+export interface LastAction {
+  type: 'envido' | 'truco' | 'fold';
+  winner: string;
+  points: number;
+  accepted?: boolean;
+  winnerPoints?: number | null;
+  envidoPoints?: Record<string, number>;
+  envidoSpoken?: Record<string, string | number>;
+  envidoSteps?: EnvidoStep[];
+  resolutionId?: number;
+}
+
+export interface ResponseBubble {
+  playerId: string;
+  text: string;
+  id: number;
+}
+
+export interface GameState {
+  id: string;
+  players: string[];
+  turnOrder: string[];
+  hands: Record<string, string[]>;
+  initialHands: Record<string, string[]>;
+  table: CardPlay[];
+  currentTrick: CardPlay[];
+  history: string[];
+  turn: string;
+  mano: string;
+  winner: string | null;
+  firstCardPlayed: Record<string, boolean>;
+  score: Score;
+  matchWinner: string | null;
+  envido: EnvidoState | null;
+  envidoPlayed: boolean;
+  truco: TrucoState;
+  lastAction: LastAction | null;
+  responseBubble: ResponseBubble | null;
+}
+
+export interface User {
+  id: string;
+  username: string;
+}
+
+const games: Record<string, GameState> = {};
+
+// Helper to send emails via Resend API
+async function sendVerificationEmail(email: string, token: string) {
+  // Siempre imprimir el código en la consola del servidor como respaldo/desarrollo
+  console.log(`📨 [Código de verificación] Para: ${email} -> Código: ${token}`);
+
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey || apiKey === "re_PLACEHOLDER") {
+    return;
   }
 
-  res.json({ user });
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        from: "Truco Argentino <onboarding@resend.dev>",
+        to: email,
+        subject: "Verifica tu cuenta - Truco Argentino",
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 10px;">
+            <h2 style="color: #2e7d32; text-align: center;">Truco Argentino</h2>
+            <p>¡Hola!</p>
+            <p>Gracias por registrarte en nuestra plataforma de Truco. Tu código de verificación de 6 dígitos es:</p>
+            <div style="font-size: 24px; font-weight: bold; text-align: center; letter-spacing: 4px; padding: 15px; background-color: #f1f8e9; border-radius: 5px; color: #2e7d32; margin: 20px 0;">
+              ${token}
+            </div>
+            <p>Ingresá este código en la aplicación para activar tu cuenta.</p>
+            <p style="color: #777; font-size: 12px; margin-top: 30px;">Si no solicitaste este registro, podés ignorar este correo.</p>
+          </div>
+        `,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("❌ Error al enviar mail con Resend:", errText);
+    } else {
+      console.log("📨 Correo enviado con éxito a", email);
+    }
+  } catch (e) {
+    console.error("❌ Excepción al enviar mail con Resend:", e);
+  }
+}
+
+interface AuthenticatedRequest extends express.Request {
+  user?: {
+    id: string;
+    username: string;
+  };
+}
+
+function authenticateToken(req: AuthenticatedRequest, res: express.Response, next: express.NextFunction) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) return res.status(401).json({ error: "No autorizado: Token faltante" });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as { id: string; username: string };
+    req.user = decoded;
+    next();
+  } catch (e) {
+    return res.status(403).json({ error: "Token inválido o expirado" });
+  }
+}
+
+// ================= REGISTRO =================
+app.post("/auth/register", async (req, res) => {
+  const { username, email, password } = req.body;
+
+  if (!username || !email || !password) {
+    return res.status(400).json({ error: "Todos los campos son obligatorios" });
+  }
+
+  try {
+    const existingUser = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { username },
+          { email }
+        ]
+      }
+    });
+
+    if (existingUser) {
+      if (existingUser.username === username) {
+        return res.status(400).json({ error: "El nombre de usuario ya está en uso" });
+      }
+      return res.status(400).json({ error: "El correo electrónico ya está registrado" });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+    const tokenVal = Math.floor(100000 + Math.random() * 900000).toString();
+
+    await prisma.user.create({
+      data: {
+        username,
+        email,
+        passwordHash,
+        verified: false,
+        verificationToken: tokenVal,
+      }
+    });
+
+    // Enviar el correo en segundo plano para no demorar la respuesta al cliente
+    sendVerificationEmail(email, tokenVal).catch(err => {
+      console.error("❌ Error en segundo plano al enviar mail:", err);
+    });
+    res.json({ message: "Usuario registrado con éxito. Por favor, verifica tu correo." });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error interno del servidor al registrar" });
+  }
+});
+
+// ================= VERIFICAR DISPONIBILIDAD DE USUARIO Y CORREO =================
+app.post("/auth/check-availability", async (req, res) => {
+  const { username, email } = req.body;
+
+  if (!username || !email) {
+    return res.status(400).json({ error: "Todos los campos son obligatorios" });
+  }
+
+  try {
+    const existingUser = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { username },
+          { email }
+        ]
+      }
+    });
+
+    if (existingUser) {
+      if (existingUser.username === username) {
+        return res.status(400).json({ error: "El nombre de usuario ya está en uso" });
+      }
+      return res.status(400).json({ error: "El correo electrónico ya está registrado" });
+    }
+
+    res.json({ available: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error al verificar disponibilidad" });
+  }
+});
+
+// ================= VERIFICAR CUENTA =================
+app.post("/auth/verify", async (req, res) => {
+  const { email, token } = req.body;
+
+  if (!email || !token) {
+    return res.status(400).json({ error: "Correo y código son requeridos" });
+  }
+
+  try {
+    const user = await prisma.user.findFirst({
+      where: { email, verificationToken: token }
+    });
+
+    if (!user) {
+      return res.status(400).json({ error: "Código de verificación inválido" });
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        verified: true,
+        verificationToken: null
+      }
+    });
+
+    res.json({ message: "Cuenta verificada con éxito. Ya podés iniciar sesión." });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error interno al verificar cuenta" });
+  }
+});
+
+// ================= REENVIAR CÓDIGO DE VERIFICACIÓN =================
+app.post("/auth/resend-code", async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: "El correo electrónico es requerido" });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { email }
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: "No existe un usuario registrado con este correo" });
+    }
+
+    if (user.verified) {
+      return res.status(400).json({ error: "Esta cuenta ya ha sido verificada" });
+    }
+
+    const tokenVal = Math.floor(100000 + Math.random() * 900000).toString();
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { verificationToken: tokenVal }
+    });
+
+    sendVerificationEmail(email, tokenVal).catch(err => {
+      console.error("❌ Error en segundo plano al reenviar mail:", err);
+    });
+
+    res.json({ message: "Se ha reenviado un nuevo código de verificación a tu correo." });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error interno al reenviar el código" });
+  }
+});
+
+// ================= INICIAR SESIÓN =================
+app.post("/auth/login", async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ error: "Usuario y contraseña son requeridos" });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { username }
+    });
+
+    if (!user) {
+      return res.status(400).json({ error: "Usuario o contraseña incorrectos" });
+    }
+
+    /*
+    if (!user.verified) {
+      return res.status(403).json({ error: "Cuenta no verificada", email: user.email });
+    }
+    */
+
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) {
+      return res.status(400).json({ error: "Usuario o contraseña incorrectos" });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, username: user.username },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        coins: user.coins,
+        wins: user.wins,
+        losses: user.losses,
+        avatarUrl: user.avatarUrl,
+      }
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error interno al iniciar sesión" });
+  }
+});
+
+// ================= OBTENER PERFIL ACTUAL =================
+app.get("/auth/me", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  if (!req.user) return res.status(401).json({ error: "No autorizado" });
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id }
+    });
+
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+
+    res.json({
+      user: {
+        id: user.id,
+        username: user.username,
+        coins: user.coins,
+        wins: user.wins,
+        losses: user.losses,
+        avatarUrl: user.avatarUrl,
+      }
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error interno al obtener perfil" });
+  }
+});
+
+// ================= CAMBIAR CONTRASEÑA =================
+app.post("/auth/change-password", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!req.user) return res.status(401).json({ error: "No autorizado" });
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: "Contraseña actual y nueva son obligatorias" });
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id }
+    });
+
+    if (!user) return res.status(404).json({ error: "Usuario no encontrado" });
+
+    const match = await bcrypt.compare(currentPassword, user.passwordHash);
+    if (!match) {
+      return res.status(400).json({ error: "La contraseña actual es incorrecta" });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(newPassword, salt);
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash }
+    });
+
+    res.json({ message: "Contraseña actualizada con éxito" });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error interno al cambiar contraseña" });
+  }
+});
+
+// ================= ACTUALIZAR AVATAR =================
+app.post("/auth/update-avatar", authenticateToken, async (req: AuthenticatedRequest, res) => {
+  const { avatarUrl } = req.body;
+  if (!req.user) return res.status(401).json({ error: "No autorizado" });
+
+  if (!avatarUrl) {
+    return res.status(400).json({ error: "El avatarUrl es requerido" });
+  }
+
+  try {
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data: { avatarUrl }
+    });
+
+    res.json({
+      user: {
+        id: user.id,
+        username: user.username,
+        coins: user.coins,
+        wins: user.wins,
+        losses: user.losses,
+        avatarUrl: user.avatarUrl,
+      }
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Error al actualizar avatar" });
+  }
 });
 
 // ================= CARTAS =================
-const palos = ["espada", "basto", "oro", "copa"];
-const numeros = ["1", "2", "3", "4", "5", "6", "7", "10", "11", "12"];
+const palos = ["espada", "basto", "oro", "copa"] as const;
+const numeros = ["1", "2", "3", "4", "5", "6", "7", "10", "11", "12"] as const;
 
-const valores = {
+const valores: Record<string, number> = {
   "1-espada": 14,
   "1-basto": 13,
   "7-espada": 12,
   "7-oro": 11,
-  3: 10,
-  2: 9,
-  1: 8,
-  12: 7,
-  11: 6,
-  10: 5,
-  7: 4,
-  6: 3,
-  5: 2,
-  4: 1,
+  "3": 10,
+  "2": 9,
+  "1": 8,
+  "12": 7,
+  "11": 6,
+  "10": 5,
+  "7": 4,
+  "6": 3,
+  "5": 2,
+  "4": 1,
 };
 
-function crearMazo() {
-  let mazo = [];
+function crearMazo(): string[] {
+  let mazo: string[] = [];
   for (let palo of palos) {
     for (let num of numeros) {
       mazo.push(`${num}-${palo}`);
@@ -58,22 +493,22 @@ function crearMazo() {
   return mazo;
 }
 
-function getValor(carta) {
-  return valores[carta] || valores[carta.split("-")[0]];
+function getValor(carta: string): number {
+  return valores[carta] || valores[carta.split("-")[0]] || 0;
 }
 
-function repartir() {
+function repartir(): [string[], string[]] {
   const mazo = crearMazo().sort(() => Math.random() - 0.5);
   return [mazo.slice(0, 3), mazo.slice(3, 6)];
 }
 
 // ================= ENVIDO =================
-function valorEnvido(carta) {
+function valorEnvido(carta: string): number {
   const num = parseInt(carta.split("-")[0]);
   return num >= 10 ? 0 : num;
 }
 
-function calcularEnvido(mano) {
+function calcularEnvido(mano: string[]): number {
   let max = 0;
 
   for (let i = 0; i < mano.length; i++) {
@@ -94,24 +529,22 @@ function calcularEnvido(mano) {
   return max;
 }
 
-function evaluarFuerzaMano(hand) {
+function evaluarFuerzaMano(hand: string[]): number {
   if (!hand || hand.length === 0) return 0;
 
-  // ranking simple basado en valor
-  const valores = hand.map((c) => {
+  const valoresMano = hand.map((c) => {
     const [num] = c.split("-");
     return parseInt(num);
   });
 
-  const max = Math.max(...valores);
+  const max = Math.max(...valoresMano);
 
-  // aproximación simple
   if (max >= 10) return 3; // fuerte
   if (max >= 6) return 2; // media
   return 1; // baja
 }
 
-function botAcceptsTruco(hand) {
+function botAcceptsTruco(hand: string[]): boolean {
   const fuerza = evaluarFuerzaMano(hand);
   const r = Math.random();
 
@@ -120,8 +553,8 @@ function botAcceptsTruco(hand) {
   return r < 0.45;
 }
 
-function handleBotAcceptOrRaiseTruco(g, gameId) {
-  const fuerza = evaluarFuerzaMano(g.hands["BOT"]);
+function handleBotAcceptOrRaiseTruco(g: GameState, gameId: string): boolean {
+  const fuerza = evaluarFuerzaMano(g.hands["BOT"] || []);
   const r = Math.random();
   const canRaiseNow = g.truco.level < 4;
 
@@ -155,7 +588,7 @@ function handleBotAcceptOrRaiseTruco(g, gameId) {
   return false;
 }
 
-function checkMatchWinner(game) {
+function checkMatchWinner(game: GameState): boolean {
   for (const playerId of game.players) {
     if (game.score[playerId] >= 30) {
       game.matchWinner = playerId;
@@ -175,13 +608,55 @@ function checkMatchWinner(game) {
         canRaiseBy: null,
       };
 
+      saveMatchResults(game);
+
       return true;
     }
   }
   return false;
 }
 
-function awardTrucoPoints(game, winner) {
+// Asynchronously persist match stats in the database
+async function saveMatchResults(game: GameState) {
+  const botId = "BOT";
+  const players = game.players;
+  const humanId = players.find(p => p !== botId);
+  if (!humanId) return;
+
+  try {
+    const isHumanWinner = game.matchWinner === humanId;
+    if (isHumanWinner) {
+      await prisma.user.update({
+        where: { id: humanId },
+        data: {
+          wins: { increment: 1 },
+          coins: { increment: 100 }
+        }
+      });
+      console.log(`🏆 DB updated: User ${humanId} won.`);
+    } else {
+      await prisma.user.update({
+        where: { id: humanId },
+        data: {
+          losses: { increment: 1 },
+          coins: { decrement: 50 }
+        }
+      });
+      const u = await prisma.user.findUnique({ where: { id: humanId } });
+      if (u && u.coins < 0) {
+        await prisma.user.update({
+          where: { id: humanId },
+          data: { coins: 0 }
+        });
+      }
+      console.log(`💀 DB updated: User ${humanId} lost.`);
+    }
+  } catch (e) {
+    console.error("❌ Error persisting match results in DB:", e);
+  }
+}
+
+function awardTrucoPoints(game: GameState, winner: string) {
   if (!winner) return;
 
   game.score[winner] += game.truco.level;
@@ -195,11 +670,49 @@ function awardTrucoPoints(game, winner) {
   checkMatchWinner(game);
 }
 
-function getNextTrucoLevel(currentLevel) {
+function getNextTrucoLevel(currentLevel: number): number {
   if (currentLevel === 1) return 2; // Truco
   if (currentLevel === 2) return 3; // Retruco
   if (currentLevel === 3) return 4; // Vale 4
   return 4;
+}
+
+// ================= ME VOY AL MAZO (FOLD) =================
+function handleFold(game: GameState, foldingPlayerId: string) {
+  const opponentId = game.players.find((p) => p !== foldingPlayerId) || "BOT";
+
+  // 1. Puntos de envido si no se jugó aún en la primera mano
+  let envidoPointsAwarded = 0;
+  if (game.history.length === 0 && !game.envidoPlayed) {
+    envidoPointsAwarded = 1; // 1 punto por el "no quiero" del envido automático
+    game.envidoPlayed = true;
+  }
+
+  // 2. Puntos de truco
+  let trucoPointsAwarded = 1;
+  if (game.truco.pending) {
+    // Si hay un canto pendiente, el rival se lleva los puntos de la instancia anterior
+    trucoPointsAwarded = game.truco.level - 1;
+  } else {
+    // Si no hay pendiente, se lleva los puntos del nivel actual
+    trucoPointsAwarded = game.truco.level;
+  }
+
+  const totalPoints = envidoPointsAwarded + trucoPointsAwarded;
+  addScore(game, opponentId, totalPoints);
+
+  game.winner = opponentId;
+  game.lastAction = {
+    type: "fold",
+    winner: opponentId,
+    points: totalPoints,
+  };
+
+  checkMatchWinner(game);
+
+  // Resetear estados pendientes
+  game.envido = null;
+  game.truco.pending = false;
 }
 
 // ================= CREAR PARTIDA =================
@@ -268,7 +781,7 @@ app.post("/game/next-hand", (req, res) => {
 
   const [p1, p2] = repartir();
 
-  // alternar mano para testing más realista
+  // alternar mano
   const nextMano =
     game.mano === game.players[0] ? game.players[1] : game.players[0];
 
@@ -325,7 +838,7 @@ app.post("/game/next-hand", (req, res) => {
 });
 
 // ================= EVALUAR BAZA =================
-function evaluarBaza(game) {
+function evaluarBaza(game: GameState) {
   if (game.currentTrick.length < 2) return;
 
   const [c1, c2] = game.currentTrick;
@@ -333,7 +846,7 @@ function evaluarBaza(game) {
   const v1 = getValor(c1.card);
   const v2 = getValor(c2.card);
 
-  let ganador;
+  let ganador: string;
 
   if (v1 > v2) ganador = c1.userId;
   else if (v2 > v1) ganador = c2.userId;
@@ -344,8 +857,8 @@ function evaluarBaza(game) {
 
   const h = game.history;
 
-  // 🧠 CASO 1: alguien ganó 2
-  let wins = {};
+  // CASO 1: alguien ganó 2 bazas
+  let wins: Record<string, number> = {};
   game.players.forEach((p) => (wins[p] = 0));
 
   h.forEach((r) => {
@@ -360,7 +873,7 @@ function evaluarBaza(game) {
     }
   }
 
-  // 🧠 CASO 2: 2 bazas jugadas
+  // CASO 2: 2 bazas jugadas
   if (h.length === 2) {
     const [r1, r2] = h;
 
@@ -368,7 +881,6 @@ function evaluarBaza(game) {
     if (r2 === "parda" && r1 !== "parda") {
       game.winner = r1;
     }
-
     // primera parda, segunda define
     else if (r1 === "parda" && r2 !== "parda") {
       game.winner = r2;
@@ -380,7 +892,7 @@ function evaluarBaza(game) {
     }
   }
 
-  // 🧠 CASO 3: 3 bazas
+  // CASO 3: 3 bazas
   if (h.length === 3) {
     const [r1, r2, r3] = h;
 
@@ -401,9 +913,39 @@ function evaluarBaza(game) {
 }
 
 // ================= SOCKETS =================
-io.on("connection", (socket) => {
+// ================= SOCKETS AUTHENTICATION HANDSHAKE =================
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) {
+    return next(new Error("Authentication error: No token provided"));
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as { id: string; username: string };
+    socket.data.user = decoded;
+    next();
+  } catch (err) {
+    next(new Error("Authentication error: Invalid token"));
+  }
+});
+
+io.on("connection", (socket: Socket) => {
   socket.on("joinGame", ({ gameId }) => {
     socket.join(gameId);
+  });
+
+  // Evento "Me voy al mazo"
+  socket.on("fold", ({ gameId, userId }) => {
+    const game = games[gameId];
+    if (!game || game.winner || game.matchWinner) return;
+
+    const isUserTurn = game.turn === userId;
+    const isUserRespondingEnvido = game.envido?.pending && game.envido.caller !== userId;
+    const isUserRespondingTruco = game.truco?.pending && game.truco.caller !== userId;
+
+    if (!isUserTurn && !isUserRespondingEnvido && !isUserRespondingTruco) return;
+
+    handleFold(game, userId);
+    io.to(gameId).emit("updateGame", game);
   });
 
   socket.on("playCard", ({ gameId, userId, card }) => {
@@ -424,7 +966,7 @@ io.on("connection", (socket) => {
     game.currentTrick.push({ userId, card });
 
     if (game.currentTrick.length === 1) {
-      game.turn = game.players.find((p) => p !== userId);
+      game.turn = game.players.find((p) => p !== userId) || "BOT";
     } else {
       evaluarBaza(game);
     }
@@ -461,7 +1003,6 @@ io.on("connection", (socket) => {
     const trucoYaAceptado = game.truco.level > 1 && !game.truco.pending;
     if (trucoYaAceptado) return;
 
-    // Si no hay envido pendiente, validamos apertura normal
     if (!game.envido?.pending) {
       if (!isManoTurn && !isPieReplyWindow && !canReplyToPendingTrucoWithEnvido)
         return;
@@ -485,18 +1026,14 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Si YA hay envido pendiente, solo puede subir el que está respondiendo
     if (game.envido.caller === userId) return;
 
-    // Validaciones de cadena
     if (type === "envido") {
       if (envidoCount >= 2 || hasReal || hasFalta) return;
     }
-
     if (type === "real") {
       if (hasReal || hasFalta) return;
     }
-
     if (type === "falta") {
       if (hasFalta) return;
     }
@@ -522,16 +1059,18 @@ io.on("connection", (socket) => {
     if (game.envido.caller === userId) return;
     showResponseBubble(gameId, userId, accept ? "Quiero" : "No Quiero");
 
+    const caller = game.envido.caller || "BOT";
+
     if (!accept) {
       const puntos = calcularNoQuiero(game.envido.calls);
 
-      addScore(game, game.envido.caller, puntos);
+      addScore(game, caller, puntos);
       checkMatchWinner(game);
 
       game.lastAction = {
         type: "envido",
         accepted: false,
-        winner: game.envido.caller,
+        winner: caller,
         points: puntos,
         envidoPoints: {},
         winnerPoints: null,
@@ -590,21 +1129,20 @@ io.on("connection", (socket) => {
 
       io.to(gameId).emit("updateGame", game);
 
-      // si el humano sube, el bot responde
       if (userId !== "BOT") {
         setTimeout(() => {
           const g = games[gameId];
           if (!g || !g.truco.pending) return;
 
-          const botAccepts = botAcceptsTruco(g.hands["BOT"]);
+          const botAccepts = botAcceptsTruco(g.hands["BOT"] || []);
 
           if (!botAccepts) {
             showResponseBubble(gameId, "BOT", "No Quiero");
-            const winner = g.truco.caller;
+            const winner = g.truco.caller || userId;
             const puntos = g.truco.level - 1;
 
             g.winner = winner;
-            addScore(game, winner, puntos);
+            addScore(g, winner, puntos);
 
             g.lastAction = {
               type: "truco",
@@ -628,7 +1166,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // CASO 2: todavía no hay truco
     if (game.truco.level === 1) {
       game.truco.level = 2;
       game.truco.pending = true;
@@ -643,15 +1180,15 @@ io.on("connection", (socket) => {
           const g = games[gameId];
           if (!g || !g.truco.pending) return;
 
-          const botAccepts = botAcceptsTruco(g.hands["BOT"]);
+          const botAccepts = botAcceptsTruco(g.hands["BOT"] || []);
 
           if (!botAccepts) {
             showResponseBubble(gameId, "BOT", "No Quiero");
-            const winner = g.truco.caller;
+            const winner = g.truco.caller || userId;
             const puntos = g.truco.level - 1;
 
             g.winner = winner;
-            addScore(game, winner, puntos);
+            addScore(g, winner, puntos);
 
             g.lastAction = {
               type: "truco",
@@ -670,7 +1207,6 @@ io.on("connection", (socket) => {
           const raised = handleBotAcceptOrRaiseTruco(g, gameId);
           if (raised) return;
 
-          // si el BOT había cantado en su turno, tras aceptar debe jugar
           if (!g.winner && g.turn === "BOT") {
             setTimeout(() => botPlay(gameId), 400);
           }
@@ -680,7 +1216,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // CASO 3: ya fue aceptado antes y suben más tarde
     if (game.truco.canRaiseBy !== userId) return;
 
     const nextLevel = getNextTrucoLevel(game.truco.level);
@@ -699,15 +1234,15 @@ io.on("connection", (socket) => {
         const g = games[gameId];
         if (!g || !g.truco.pending) return;
 
-        const botAccepts = botAcceptsTruco(g.hands["BOT"]);
+        const botAccepts = botAcceptsTruco(g.hands["BOT"] || []);
 
         if (!botAccepts) {
           showResponseBubble(gameId, "BOT", "No Quiero");
-          const winner = g.truco.caller;
+          const winner = g.truco.caller || userId;
           const puntos = g.truco.level - 1;
 
           g.winner = winner;
-          addScore(game, winner, puntos);
+          addScore(g, winner, puntos);
 
           g.lastAction = {
             type: "truco",
@@ -736,7 +1271,7 @@ io.on("connection", (socket) => {
     showResponseBubble(gameId, userId, accept ? "Quiero" : "No Quiero");
 
     if (!accept) {
-      const winner = game.truco.caller;
+      const winner = game.truco.caller || "BOT";
       const puntos = game.truco.level - 1;
 
       game.winner = winner;
@@ -749,7 +1284,6 @@ io.on("connection", (socket) => {
       };
 
       checkMatchWinner(game);
-
       game.truco.pending = false;
 
       io.to(gameId).emit("updateGame", game);
@@ -768,8 +1302,8 @@ io.on("connection", (socket) => {
   });
 });
 
-// ================= BOT =================
-function botPlay(gameId) {
+// ================= BOT PLAY IA =================
+function botPlay(gameId: string) {
   const game = games[gameId];
   if (!game || game.winner || game.matchWinner || game.envido?.pending) return;
   if (game.turn !== "BOT") return;
@@ -783,12 +1317,12 @@ function botPlay(gameId) {
     }
   }
 
-  const hand = game.hands["BOT"];
+  const hand = game.hands["BOT"] || [];
   hand.sort((a, b) => getValor(b) - getValor(a));
 
-  // IA: decidir si canta truco antes de jugar
+  // Decidir si canta truco antes de jugar
   if (!game.truco.pending && game.truco.level === 1 && !game.envido?.pending) {
-    const fuerza = evaluarFuerzaMano(game.hands["BOT"]);
+    const fuerza = evaluarFuerzaMano(game.hands["BOT"] || []);
     const r = Math.random();
 
     if ((fuerza === 3 && r < 0.5) || (fuerza === 2 && r < 0.2)) {
@@ -802,6 +1336,9 @@ function botPlay(gameId) {
   }
 
   const card = hand.shift();
+  if (!card) return;
+
+  game.hands["BOT"] = hand;
 
   if (!game.firstCardPlayed["BOT"]) {
     game.firstCardPlayed["BOT"] = true;
@@ -823,12 +1360,12 @@ function botPlay(gameId) {
   }
 }
 
-function addScore(game, playerId, points) {
+function addScore(game: GameState, playerId: string, points: number) {
   const newScore = (game.score[playerId] || 0) + points;
   game.score[playerId] = Math.min(newScore, 30);
 }
 
-function showResponseBubble(gameId, playerId, text) {
+function showResponseBubble(gameId: string, playerId: string, text: string) {
   const game = games[gameId];
   if (!game) return;
 
@@ -854,7 +1391,7 @@ function showResponseBubble(gameId, playerId, text) {
   }, 1500);
 }
 
-function responderEnvidoBot(gameId) {
+function responderEnvidoBot(gameId: string) {
   const game = games[gameId];
   if (!game || !game.envido?.pending) return;
 
@@ -864,14 +1401,18 @@ function responderEnvidoBot(gameId) {
     showResponseBubble(gameId, "BOT", "No Quiero");
     const puntos = calcularNoQuiero(game.envido.calls);
 
-    addScore(game, game.envido.caller, puntos);
+    addScore(game, game.envido.caller || "BOT", puntos);
     checkMatchWinner(game);
 
     game.lastAction = {
       type: "envido",
-      winner: game.envido.caller,
+      accepted: false,
+      winner: game.envido.caller || "BOT",
       points: puntos,
       envidoPoints: {},
+      winnerPoints: null,
+      envidoSteps: [],
+      resolutionId: Date.now(),
     };
 
     game.envido = null;
@@ -893,14 +1434,14 @@ function responderEnvidoBot(gameId) {
   io.to(gameId).emit("updateGame", game);
 }
 
-function resolverEnvidoCompleto(game) {
+function resolverEnvidoCompleto(game: GameState) {
   const resultado = resolverGanadorEnvido(game);
   const winner = resultado.winner;
   const envidoPoints = resultado.puntos;
 
   const canto = buildEnvidoCanto(game, envidoPoints);
 
-  const puntos = calcularPuntosEnvido(game.envido.calls, game, winner);
+  const puntos = calcularPuntosEnvido(game.envido!.calls, game, winner);
 
   addScore(game, winner, puntos);
   checkMatchWinner(game);
@@ -918,7 +1459,7 @@ function resolverEnvidoCompleto(game) {
   };
 
   console.log("====== ENVIDO FINAL ======");
-  console.log("Cadena:", game.envido.calls.join(" -> "));
+  console.log("Cadena:", game.envido!.calls.join(" -> "));
   console.log("Puntos:", envidoPoints);
   console.log("Ganador:", winner, "+", puntos);
   console.log("Cantados:", canto.spoken);
@@ -936,7 +1477,7 @@ function resolverEnvidoCompleto(game) {
   }
 }
 
-function calcularPuntosEnvido(calls, game, winner) {
+function calcularPuntosEnvido(calls: string[], game: GameState, winner: string): number {
   let puntos = 0;
 
   for (let c of calls) {
@@ -944,7 +1485,7 @@ function calcularPuntosEnvido(calls, game, winner) {
     if (c === "real") puntos += 3;
 
     if (c === "falta") {
-      const loser = game.players.find((p) => p !== winner);
+      const loser = game.players.find((p) => p !== winner) || "BOT";
       return 30 - game.score[loser];
     }
   }
@@ -952,7 +1493,7 @@ function calcularPuntosEnvido(calls, game, winner) {
   return puntos;
 }
 
-function calcularNoQuiero(calls) {
+function calcularNoQuiero(calls: string[]): number {
   if (calls.length === 1) return 1;
 
   let puntos = 0;
@@ -965,27 +1506,26 @@ function calcularNoQuiero(calls) {
   return puntos;
 }
 
-function getTeamIndex(game, playerId) {
+function getTeamIndex(game: GameState, playerId: string): number {
   const index = game.players.indexOf(playerId);
   return index % 2;
 }
 
-function buildEnvidoCanto(game, envidoPoints) {
+function buildEnvidoCanto(game: GameState, envidoPoints: Record<string, number>) {
   const order =
     game.turnOrder && game.turnOrder.length ? game.turnOrder : game.players;
 
-  let currentWinner = null;
+  let currentWinner: string | null = null;
   let currentWinningPoints = -1;
-  let currentWinningTeam = null;
+  let currentWinningTeam: number | null = null;
 
-  const spoken = {};
-  const steps = [];
+  const spoken: Record<string, string | number> = {};
+  const steps: EnvidoStep[] = [];
 
   for (const playerId of order) {
-    const points = envidoPoints[playerId];
+    const points = envidoPoints[playerId] ?? 0;
     const teamIndex = getTeamIndex(game, playerId);
 
-    // el primero siempre canta
     if (currentWinner === null) {
       currentWinner = playerId;
       currentWinningPoints = points;
@@ -1000,7 +1540,6 @@ function buildEnvidoCanto(game, envidoPoints) {
       continue;
     }
 
-    // solo canta puntos si puede matar al que va ganando Y es del equipo rival
     if (teamIndex !== currentWinningTeam && points > currentWinningPoints) {
       currentWinner = playerId;
       currentWinningPoints = points;
@@ -1023,29 +1562,27 @@ function buildEnvidoCanto(game, envidoPoints) {
   }
 
   return {
-    winner: currentWinner,
+    winner: currentWinner || order[0],
     winnerPoints: currentWinningPoints,
     spoken,
     steps,
   };
 }
 
-function resolverGanadorEnvido(game) {
+function resolverGanadorEnvido(game: GameState) {
   const players = game.players;
 
-  // equipos alternados
   const teamA = players.filter((_, i) => i % 2 === 0);
   const teamB = players.filter((_, i) => i % 2 !== 0);
 
-  const puntos = {};
+  const puntos: Record<string, number> = {};
   players.forEach((p) => {
-    puntos[p] = calcularEnvido(game.initialHands[p]);
+    puntos[p] = calcularEnvido(game.initialHands[p] || []);
   });
 
-  const mejorA = Math.max(...teamA.map((p) => puntos[p]));
-  const mejorB = Math.max(...teamB.map((p) => puntos[p]));
+  const mejorA = Math.max(...teamA.map((p) => puntos[p] ?? 0));
+  const mejorB = Math.max(...teamB.map((p) => puntos[p] ?? 0));
 
-  // ganador directo por equipo
   if (mejorA > mejorB) {
     return { winner: teamA[0], puntos };
   }
@@ -1053,27 +1590,27 @@ function resolverGanadorEnvido(game) {
     return { winner: teamB[0], puntos };
   }
 
-  // empate → desempate por orden relativo
   const candidatos = players.filter((p) => puntos[p] === mejorA);
-
   const order =
-    game.turnOrder && game.turnOrder.length ? game.turnOrder : players; // fallback seguro
+    game.turnOrder && game.turnOrder.length ? game.turnOrder : players;
 
   for (let p of order) {
     if (candidatos.includes(p)) {
       return { winner: p, puntos };
     }
   }
+
+  return { winner: order[0], puntos };
 }
 
-function evaluarFuerzaEnvido(points) {
+function evaluarFuerzaEnvido(points: number): number {
   if (points >= 30) return 4; // excelente
   if (points >= 27) return 3; // fuerte
   if (points >= 24) return 2; // media
   return 1; // floja
 }
 
-function getBotEnvidoDecision(game) {
+function getBotEnvidoDecision(game: GameState): { action: string; raiseType?: string } {
   const botPoints = calcularEnvido(game.initialHands["BOT"] || []);
   const fuerza = evaluarFuerzaEnvido(botPoints);
 
@@ -1083,9 +1620,7 @@ function getBotEnvidoDecision(game) {
   const hasFalta = calls.includes("falta");
 
   const r = Math.random();
-
-  // qué podría subir legalmente
-  const opciones = [];
+  const opciones: string[] = [];
 
   if (envidoCount < 2 && !hasReal && !hasFalta) {
     opciones.push("envido");
@@ -1126,7 +1661,6 @@ function getBotEnvidoDecision(game) {
     return { action: "reject" };
   }
 
-  // mano floja
   if (opciones.length && r < 0.05) {
     return { action: "raise", raiseType: opciones[0] };
   }
@@ -1134,19 +1668,21 @@ function getBotEnvidoDecision(game) {
   return { action: "reject" };
 }
 
-function maybeBotCallEnvido(gameId) {
+function maybeBotCallEnvido(gameId: string) {
   const game = games[gameId];
   if (!game || game.winner || game.matchWinner) return;
   if (game.envido?.pending || game.envidoPlayed) return;
 
-  // solo antes de jugar su primera carta
   if (game.firstCardPlayed?.["BOT"]) return;
+
+  // BUG FIX: Si el truco ya se cantó/aceptó (level > 1), no se puede iniciar envido de la nada
+  if (game.truco && game.truco.level > 1) return;
 
   const botPoints = calcularEnvido(game.initialHands["BOT"] || []);
   const fuerza = evaluarFuerzaEnvido(botPoints);
   const r = Math.random();
 
-  let initialCall = null;
+  let initialCall: string | null = null;
 
   if (fuerza === 4) {
     if (r < 0.2) initialCall = "falta";
@@ -1157,8 +1693,6 @@ function maybeBotCallEnvido(gameId) {
     else if (r < 0.5) initialCall = "envido";
   } else if (fuerza === 2) {
     if (r < 0.15) initialCall = "envido";
-  } else {
-    initialCall = null;
   }
 
   if (!initialCall) return;
@@ -1173,4 +1707,4 @@ function maybeBotCallEnvido(gameId) {
   io.to(gameId).emit("updateGame", game);
 }
 
-server.listen(3000, () => console.log("Server running"));
+server.listen(3000, () => console.log("Server running on port 3000"));
